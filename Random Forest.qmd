@@ -1,0 +1,173 @@
+---
+title: "Random Forest"
+format: html
+editor: visual
+---
+
+### Importando os dados
+
+Importamos os dados de treinamento já tratados anteriormente.
+
+```{r}
+load("datasets/pns_train.RData")
+
+library(tidymodels)
+library(dials)
+library(tidyverse)
+library(themis)
+library(janitor)
+library(future)
+library(tictoc)
+```
+
+### Receita
+
+A `recipe` é como uma lista de instruções para preparar os dados antes de entregá-los ao modelo. É a parte mais crucial para garantir consistência e robustez.
+
+```{r}
+recipe_rf <- recipe(depressao ~ ., data = pns_train) %>%
+  
+  # 1. Imputação de valores ausentes
+  # 1.1. Numéricas - KNN
+  step_impute_knn(all_numeric_predictors(), neighbors = 3) %>%
+  # 1.2 Categóricas - moda
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # 2. Tratamento de variáveis categóricas
+  # Substitui NA por "unknown" e evita problemas na criação de dummies
+  step_unknown(all_nominal_predictors()) %>%
+  
+  # 3. Remove colunas sem variância (colunas constantes)
+  step_zv(all_predictors()) %>%
+  
+  # 4. Balanceamento de classes (downsample da classe majoritária)
+  step_downsample(depressao)
+  #step_smote(depressao)
+
+```
+
+### Treinamento de Regressão logística polinomial regularizada
+
+Configurando a Paralelização
+
+```{r}
+# Paralelizando
+plan(multisession, workers = parallel::detectCores() -1)
+# plan(sequential)
+```
+
+### Definição da Especificação do Modelo
+
+Especifica rand_forest() para classificação. O motor "ranger" é uma implementação em C++ extremamente rápida e popular.
+
+```{r}
+rf_spec <- rand_forest(
+  mtry = tune(),       # número de variáveis testadas em cada split (hyperparam)
+  min_n = tune(),      # número mínimo de observações por nó terminal (hyperparam)
+  trees = 1000         # número de árvores na floresta
+) %>%
+  set_engine("ranger") %>%
+  set_mode("classification")
+```
+
+### Criação do Fluxo de Trabalho (Workflow)
+
+Um 'workflow' é um objeto do tidymodels que age como um "container". Ele empacota o pré-processamento (a recipe) e a especificação do modelo (o model spec). Isso é extremamente útil porque simplifica todo o processo de treinamento e predição, garantindo que os dados passem pelas etapas corretas e na ordem certa.
+
+```{r}
+rf_wkfl <- workflow() %>%
+  # Adiciona o plano de pré-processamento
+  add_recipe(recipe_rf) %>%
+  # Adiciona a especificação do modelo
+  add_model(rf_spec)
+```
+
+### Preparação da Reamostragem (Resampling)
+
+Para avaliar o quão bem nosso modelo funciona, não podemos usar o conjunto de teste ainda. Em vez disso, usamos a validação cruzada (cross-validation) no conjunto de treino. vfold_cv() divide o conjunto de treino (`pnsTrain`) em 10 partes (ou "folds"). O modelo será treinado 10 vezes: a cada vez, ele usa 9 partes para treinar e 1 para validar. Isso nos dá uma estimativa de performance muito mais estável e confiável.
+
+```{r}
+folds <- vfold_cv(pns_train, v = 10)
+```
+
+### Métricas para Otimização
+
+Cria o conjunto de métricas a serem utilizadas para avaliar o modelo
+
+```{r}
+metricas_completas <- metric_set(
+  accuracy,
+  roc_auc,
+  precision,
+  recall,
+  metric_tweak("f2", f_meas, beta = 2) # cria o F2-score
+)
+```
+
+### Otimização (Tuning) dos Hiperparâmetros
+
+`tune_grid()` irá testar sistematicamente diferentes valores para os hiperparâmetros que marcamos com `tune()` anteriormente (penalty e mixture).
+
+```{r}
+
+tic("Treinamento do modelo")
+fit_rf  <- rf_wkfl %>% 
+    tune_grid(
+      
+      # `resamples = folds`: Informa à função para usar a validação cruzada de 10 folds
+      # que criamos acima como estratégia de avaliação.
+      resamples = folds,
+      
+      # `grid = 50`: Em vez de definirmos manualmente quais valores testar,
+      # pedimos ao `tune` para gerar automaticamente uma grade com 50 combinações
+      # inteligentes e distintas de mtry e min_n para testar.
+      grid = 100,
+      
+      # `metrics`: Define qual métrica será usada para julgar qual combinação é a melhor.
+      # `roc_auc` (Area Under the ROC Curve) é uma excelente métrica para classificação binária,
+      # pois mede a habilidade do modelo de distinguir entre as classes.
+      metrics = metricas_completas
+    )
+
+toc()
+```
+
+### Salvando modelo treinado
+
+```{r}
+saveRDS(fit_rf, file = "random_forest_smote.rds")
+#fit_rf 
+```
+
+### Análise dos Resultados da Otimização
+
+```{r}
+# A função `select_best()` examina os resultados da otimização (`fit_log_reg`)
+# e extrai a linha com a melhor performance, de acordo com a métrica especificada.
+best_params <- select_best(fit_rf, metric = "roc_auc")
+
+# Imprime o tibble `best_params` para vermos os valores exatos de `penalty` e `mixture`
+# que resultaram no melhor modelo.
+best_params
+
+# 2. MOSTRAR OS MELHORES (PARA COMPARAÇÃO):
+# A função `show_best()` é similar, mas em vez de extrair apenas o melhor,
+# ela exibe uma tabela com os 5 melhores modelos por padrão.
+# É útil para ver se outras combinações de parâmetros tiveram performance parecida.
+show_best(fit_rf, metric = metricas_completas)
+```
+
+```{r}
+# Isso criará um gráfico para cada métrica, mostrando o desempenho
+# em relação aos valores dos hiperparâmetros
+autoplot(fit_log_reg)
+```
+
+### Extraindo melhores hiperparâmetros
+
+```{r}
+resultados_rf <- fit_rf %>% 
+  collect_metrics(type = "wide")  %>% 
+  arrange(desc(roc_auc))
+resultados_rf
+```

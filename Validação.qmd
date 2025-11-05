@@ -1,0 +1,270 @@
+---
+title: "Validação"
+format: html
+editor: visual
+---
+
+```{r}
+library(DALEX)
+library(DALEXtra)
+library(dplyr)
+library(keras)
+library(tidyr)
+library(tidyverse)
+library(tidymodels)
+```
+
+## Importação dos Modelos
+
+Importamos os objetos de hiperparâmetros resultados dos tunnings.
+
+```{r}
+
+fit_log_reg = readRDS("hiperparametros/regressao_logistica.rds")
+fit_rf = readRDS("hiperparametros/random_forest.rds")
+fit_xgb = readRDS("hiperparametros/xgboost.rds")
+fit_nn = readRDS("hiperparametros/rede_neural.rds")
+
+```
+
+## Seleção de melhores hiperparâmetros
+
+```{r}
+
+best_log_reg <- collect_metrics(fit_log_reg) %>%
+  filter(.config == "pre01_mod37_post0") %>%
+  select(penalty, mixture, spline_deg) %>%
+  slice(1) 
+best_log_reg
+
+best_rf <- collect_metrics(fit_rf) %>%
+  filter(.config == "pre0_mod05_post0") %>%
+  select(mtry, min_n)%>%
+  slice(1)
+best_rf
+
+best_xgb <- collect_metrics(fit_xgb) %>%
+  filter(.config == "pre0_mod045_post0") %>%
+  select(mtry, min_n, tree_depth, learn_rate, loss_reduction, sample_size)%>%
+  slice(1)
+best_xgb
+
+best_nn <- collect_metrics(fit_nn) %>%
+  filter(.config == "pre0_mod03_post0") %>%
+  select(hidden_units, penalty, epochs)%>%
+  slice(1)
+best_nn
+```
+
+### Finalizando os Workflows
+
+```{r}
+# 0. Importa dados de Treinamento
+load("datasets/pns_train.RData")
+
+# 1. Finaliza e Treina Regressão Logística
+final_log_reg_wf <- finalize_workflow(wkfl_log_reg, best_log_reg)
+fit_log_reg_final <- fit(final_log_reg_wf, data = pns_train)
+
+# 2. Finaliza e Treina Random Forest
+final_rf_wf <- finalize_workflow(rf_wkfl, best_rf)
+fit_rf_final <- fit(final_rf_wf, data = pns_train)
+
+# 3. Finaliza e Treina XGBoost
+final_xgb_wf <- finalize_workflow(xgb_wkfl, best_xgb)
+fit_xgb_final <- fit(final_xgb_wf, data = pns_train)
+
+# 4. Finaliza e Treina Rede Neural
+final_nn_wf <- finalize_workflow(nn_wkfl, best_nn)
+fit_nn_final <- fit(final_nn_wf, data = pns_train)
+
+saveRDS(fit_log_reg_final, file = "modelos/fit_log_reg.rds")
+saveRDS(fit_rf_final,      file = "modelos/fit_rf.rds")
+saveRDS(fit_xgb_final,     file = "modelos/fit_xgb.rds")
+saveRDS(fit_nn_final,      file = "modelos/fit_nn.rds")
+```
+
+Caso já tenha os modelos salvos, basta importá-los
+
+```{r}
+
+fit_log_reg_final <- readRDS("modelos/fit_log_reg.rds")
+fit_rf_final <- readRDS("modelos/fit_rf.rds")
+fit_xgb_final <- readRDS("modelos/fit_xgb.rds")
+fit_nn_final <- readRDS("modelos/fit_nn.rds")
+
+```
+
+### Coletando predições
+
+```{r}
+# Função auxiliar para prever e formatar
+get_test_predictions <- function(fitted_model, model_name, test_data) {
+  preds_class <- predict(fitted_model, new_data = test_data, type = "class")
+  preds_prob <- predict(fitted_model, new_data = test_data, type = "prob")
+  
+  test_data %>%
+    select(depressao) %>%
+    bind_cols(preds_class, preds_prob) %>%
+    mutate(model = model_name)
+}
+
+load("datasets/pns_test.RData")
+
+# Coleta predições de cada modelo
+preds_log_reg <- get_test_predictions(fit_log_reg_final, "Reg. Logística", pns_test)
+preds_rf      <- get_test_predictions(fit_rf_final,      "Random Forest",  pns_test)
+preds_xgb     <- get_test_predictions(fit_xgb_final,     "XG Boost",       pns_test)
+preds_nn      <- get_test_predictions(fit_nn_final,      "Rede Neural",    pns_test)
+
+# Empilha todas em uma tabela
+all_test_predictions <- bind_rows(
+  preds_log_reg,
+  preds_rf,
+  preds_xgb,
+  preds_nn
+)
+
+# Inspeciona o resultado
+all_test_predictions %>% print(n = 8)
+```
+
+### Validação
+
+```{r}
+# Comoparando métricas
+my_metrics <- metric_set(accuracy, f_meas, precision, recall, roc_auc)
+
+# 2. Calcula as métricas, agrupando por modelo
+validation_metrics <- all_test_predictions %>%
+  group_by(model) %>%
+  my_metrics(
+    truth = depressao,
+    estimate = .pred_class,
+    .pred_Sim, 
+    event_level = "second"
+  )
+
+# 3. Tabela de comparação
+validation_metrics %>%
+  arrange(.metric,desc(.estimate))
+```
+
+### Importância das Features
+
+Preparação para verificar a importância das Features do XG Boost
+
+```{r}
+
+bare_model_fit <- extract_fit_parsnip(fit_xgb_final)
+
+# Extraia a receita treinada (que sabe como pré-processar)
+trained_recipe <- extract_recipe(fit_xgb_final)
+
+processed_train_x <- bake(trained_recipe, new_data = pns_train_clean, all_predictors())
+
+processed_train_x_matrix <- as.matrix(processed_train_x)
+
+new_pred_wrapper <- function(model, newdata) {
+  # 'newdata' aqui será uma matrix
+  preds_vector <- predict(model, newdata = newdata)
+  return(preds_vector)
+}
+```
+
+Verificando e plotando Importância das Features XG Boost
+
+```{r}
+vip(
+  bare_model_fit,
+  method = "permute",
+  train = processed_train_x_matrix,  # <-- Use a MATRIX aqui
+  target = train_y,
+  metric = "logloss",
+  pred_wrapper = new_pred_wrapper
+)
+```
+
+Preparação para verificar a importância das Features do Random Forest
+
+```{r}
+y_train <- train_baked$depressao
+X_train <- train_baked %>% select(-depressao)
+
+# Garantir que preditores não sejam fatores
+X_train <- X_train %>%
+  mutate(across(where(is.factor), as.character)) %>%
+  as.data.frame(stringsAsFactors = FALSE)
+
+# Converter o target para numérico (0/1)
+# Caso os níveis sejam "Sim" e "Não", "Depressão" e "Sem depressão", etc.
+y_train_num <- ifelse(y_train == levels(y_train)[2], 1, 0)
+
+# Criar explainer
+explainer_rf <- explain_tidymodels(
+  model = rf_model,
+  data  = X_train,
+  y     = y_train_num,
+  label = "Random Forest",
+  verbose = FALSE
+)
+
+# Calcular permutation importance
+set.seed(123)
+vi_rf <- model_parts(explainer_rf, type = "difference")
+
+# Selecionar top 10
+vi_top <- vi_rf %>%
+  filter(!variable %in% c("_full_model_", "_baseline_")) %>%
+  arrange(desc(dropout_loss)) %>%
+  slice_head(n = 10)
+
+
+
+```
+
+Verificando e plotando Importância das Features Random Forest
+
+```{r}
+# vetor de rótulos
+labels <- c(
+  "sexo" = "Sexo",
+  "freq_problema_sono" = "Problemas de Sono",
+  "idade" = "Idade",
+  "freq_deprimido" = "Percepção de Depressão",
+  "cor_raca" = "Cor / Raça",
+  "faixa_rendimento" = "Rendimento Financeiro"
+)
+
+# garantir que 'variable' é factor com a ordem já definida
+vi_top$variable <- factor(as.character(vi_top$variable), levels = levels(vi_top$variable))
+
+# rótulos na mesma ordem dos níveis atuais
+level_labels <- labels[levels(vi_top$variable)]
+
+# mapear rótulos mantendo alinhamento correto, mas agora invertendo a ordem
+vi_top$variable_label <- factor(
+  level_labels[as.integer(vi_top$variable)],
+  levels = level_labels  # <- antes estava rev(level_labels)
+)
+
+# gráfico final (ordem invertida)
+ggplot(vi_top, aes(x = variable_label, y = dropout_loss)) +
+  geom_col(fill = "#2c3e50") +
+  coord_flip() +
+  labs(
+    title = "Preditores de Depressão - Random Forest",
+    subtitle = "Importância por Permutação (DALEX)",
+    x = "",
+    y = "Diferença no Erro (quanto maior, mais importante)"
+  ) +
+  theme_minimal(base_size = 13)
+
+ggsave(
+  filename = "importancia_rf.pdf",  # ou .eps / .svg
+  plot = last_plot(),               # último gráfico gerado
+  width = 8, height = 5, units = "in",  # tamanho
+  dpi = 300,                        # qualidade de exportação
+  device = cairo_pdf                # melhor renderizador vetorial
+)
+```

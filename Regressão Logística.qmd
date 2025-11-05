@@ -1,0 +1,250 @@
+---
+title: "Regressão Logística"
+format: html
+editor: visual
+---
+
+### Importando os dados
+
+Importamos os dados de treinamento já tratados anteriormente.
+
+```{r}
+load("datasets/pns_train.RData")
+
+library(tidymodels)
+library(dials)
+library(tidyverse)
+library(themis)
+library(janitor)
+library(future)
+library(tictoc)
+library(finetune)
+```
+
+### Receita
+
+A `recipe` é como uma lista de instruções para preparar os dados antes de entregá-los ao modelo. É a parte mais crucial para garantir consistência e robustez.
+
+```{r}
+recipe <- recipe(depressao ~ ., data = pns_train) %>%
+  
+  # 1. Imputação de valores ausentes (calculados antes do downsampling)
+  step_impute_median(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # 2. Tratamento de níveis categóricos
+  step_unknown(all_nominal_predictors()) %>%
+  
+  # 3. Modelagem de relações não-lineares
+  step_spline_natural(all_numeric_predictors(), deg_free = tune("spline_deg")) %>%
+  
+  # 4. Criação de dummies para variáveis categóricas
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  
+  # 5. remove preditores inúteis
+  step_zv(all_predictors()) %>%
+  
+  # 6. Normalização: crucial para glmnet
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # 7. Balanceamento de classes
+  step_downsample(depressao)
+
+
+recipe_knn <- recipe(depressao ~ ., data = pns_train) %>%
+  
+  # 1. Tratamento inicial de categóricas
+  step_unknown(all_nominal_predictors()) %>%
+  
+  # 2. Imputação de valores ausentes
+  # 2.1. Numéricas - KNN
+  step_impute_knn(all_numeric_predictors(), neighbors = 3) %>%
+  # 2.2 Categóricas - moda
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # Transformação de potência
+  step_YeoJohnson(all_numeric_predictors()) %>%
+  
+  # 3. Modelagem de relações não lineares (agora os dados estão completos)
+  step_spline_natural(all_numeric_predictors(), deg_free = tune("spline_deg")) %>%
+  
+  # 4. Transformação de categóricas em dummies
+  step_dummy(all_nominal_predictors(), one_hot = TRUE) %>%
+  
+  # 5. "Higiene" dos dados (remove colunas constantes)
+  step_zv(all_predictors()) %>%
+  
+  # 6. Normalização (agora que não existem mais NA)
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # 7. Balanceamento de classes por último
+  step_downsample(depressao)
+  #step_smote(depressao)
+
+```
+
+### Treinamento de Regressão logística polinomial regularizada
+
+Configurando a Paralelização
+
+```{r}
+# Paralelizando
+plan(multisession, workers = parallel::detectCores())
+# plan(sequential)
+```
+
+### Definição da Especificação do Modelo
+
+Cria uma "receita" para o modelo de regressão logística. Não realiza oa treinamento, apenas define suas características e quais parâmetros serão otimizados.
+
+```{r}
+log_reg <- logistic_reg(
+  
+  # Define o "motor" (pacote) que será usado para treinar o modelo.
+  # "glmnet" é uma escolha poderosa porque implementa regressão regularizada (Elastic Net),
+  # o que ajuda a prevenir o superajuste (overfitting) e pode até fazer seleção de variáveis.
+  engine = "glmnet",
+  
+  # O hiperparâmetro 'penalty' (conhecido como lambda no glmnet) controla a
+  # QUANTIDADE total de regularização. Um valor maior encolhe mais os coeficientes do modelo.
+  # `tune()` indica para o processo de otimização encontrar o melhor valor.
+  penalty = tune(),
+  
+  # O hiperparâmetro 'mixture' (conhecido como alpha no glmnet) controla o
+  # TIPO de regularização, variando de 0 (Ridge, L2) a 1 (Lasso, L1).
+  # Lasso (1) pode zerar coeficientes, efetivamente selecionando variáveis.
+  # Ridge (0) apenas os encolhe. Um valor entre 0 e 1 é um mix (Elastic Net).
+  # `tune()` indica para o processo de otimização encontrar o melhor valor.
+  mixture = tune()
+)
+```
+
+### Criação do Fluxo de Trabalho (Workflow)
+
+Um 'workflow' é um objeto do tidymodels que age como um "container". Ele empacota o pré-processamento (a recipe) e a especificação do modelo (o model spec). Isso é extremamente útil porque simplifica todo o processo de treinamento e predição, garantindo que os dados passem pelas etapas corretas e na ordem certa.
+
+```{r}
+wkfl_log_reg <- workflow() %>% 
+  
+  # Adiciona ao workflow o nosso plano de pré-processamento e engenharia de features.
+  # O objeto `recipe_knn` contém todas as regras para preparar os dados antes
+  # de entregá-los ao modelo (ex: imputação, criação de dummies, normalização, etc.).
+  add_recipe(recipe_knn) %>% 
+  
+  # Adiciona ao workflow a especificação do modelo que definimos anteriormente.
+  # O objeto `log_reg` contém as "instruções" de qual algoritmo usar (regressão logística),
+  # qual motor (glmnet) e quais hiperparâmetros nós queremos otimizar (penalty e mixture).
+  add_model(log_reg)
+
+```
+
+### Preparação da Reamostragem (Resampling)
+
+Para avaliar o quão bem nosso modelo funciona, não podemos usar o conjunto de teste ainda. Em vez disso, usamos a validação cruzada (cross-validation) no conjunto de treino. vfold_cv() divide o conjunto de treino (`pnsTrain`) em 10 partes (ou "folds"). O modelo será treinado 10 vezes: a cada vez, ele usa 9 partes para treinar e 1 para validar. Isso nos dá uma estimativa de performance muito mais estável e confiável.
+
+```{r}
+folds <- vfold_cv(pns_train, v = 10)
+```
+
+### Métricas para avaliação
+
+```{r}
+# Cria o conjunto de métricas a serem utilizadas para avaliar o modelo
+metricas_completas <- metric_set(
+  accuracy,
+  roc_auc,
+  precision,
+  recall,
+  metric_tweak("f2", f_meas, beta = 2) # cria o F2-score
+)
+```
+
+### Otimização (Tuning) dos Hiperparâmetros
+
+`tune_grid()` irá testar sistematicamente diferentes valores para os hiperparâmetros que marcamos com `tune()` anteriormente (penalty e mixture).
+
+```{r}
+tic("Treinamento do modelo")
+
+fit_log_reg <- wkfl_log_reg %>% 
+    tune_grid(
+      
+      # `resamples = folds`: Informa à função para usar a validação cruzada de 10 folds
+      # que criamos acima como estratégia de avaliação.
+      resamples = folds,
+      
+      # `grid = 50`: Em vez de definirmos manualmente quais valores testar,
+      # pedimos ao `tune` para gerar automaticamente uma grade com 50 combinações
+      # inteligentes e distintas de `penalty` e `mixture` para testar.
+      grid = 100,
+      
+      # `metrics`: Define qual métrica será usada para julgar qual combinação é a melhor.
+      # `roc_auc` (Area Under the ROC Curve) é uma excelente métrica para classificação binária,
+      # pois mede a habilidade do modelo de distinguir entre as classes.
+      metrics = metricas_completas
+    )
+
+toc()
+
+```
+
+### Salvando modelo treinado
+
+```{r}
+saveRDS(fit_log_reg, file = "regressao_logistica_smote.rds")
+```
+
+### Análise rápida do resultado da Otimização
+
+```{r}
+fit_log_reg = readRDS("regressao_logistica3.rds")
+
+# A função `select_best()` examina os resultados da otimização (`fit_log_reg`)
+# e extrai a linha com a melhor performance, de acordo com a métrica especificada.
+best_params <- select_best(fit_log_reg, metric = "roc_auc")
+
+# Imprime o tibble `best_params` para vermos os valores exatos de `penalty` e `mixture`
+# que resultaram no melhor modelo.
+best_params
+
+# A função `show_best()` é similar, mas em vez de extrair apenas o melhor,
+# ela exibe uma tabela com os 5 melhores modelos por padrão.
+# Útil para ver se outras combinações de parâmetros tiveram performance parecida.
+show_best(fit_log_reg, metric = 'roc_auc')
+show_best(fit_log_reg, metric = 'precision')
+show_best(fit_log_reg, metric = 'recall')
+show_best(fit_log_reg, metric = 'accuracy')
+```
+
+```{r}
+# Isso criará um gráfico para cada métrica, mostrando o desempenho
+# em relação aos valores dos hiperparâmetros (penalty e mixture)
+autoplot(fit_log_reg)
+```
+
+### Extraindo melhores hiperparâmetros
+
+```{r}
+resultados_log_reg <- fit_log_reg %>% 
+  collect_metrics(type = "wide")  %>% 
+  arrange(desc(roc_auc))
+resultados_log_reg
+```
+
+```{r}
+
+# Isso criará um gráfico para cada métrica, mostrando o desempenho
+# em relação aos valores dos hiperparâmetros (penalty e mixture)
+autoplot(fit_log_reg)
+```
+
+```{r}
+tabela_metricas <- collect_metrics(fit_log_reg) %>%
+  select(.metric, mean, std_err, .config) %>%
+  tidyr::pivot_wider(
+    names_from = .metric,
+    values_from = mean
+  ) %>%
+  arrange(desc(roc_auc))
+tabela_metricas
+```

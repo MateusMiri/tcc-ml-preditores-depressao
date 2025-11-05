@@ -1,0 +1,230 @@
+---
+title: "XG Boost"
+format: html
+editor: visual
+---
+
+### Importando os dados
+
+Importamos os dados de treinamento já tratados anteriormente.
+
+```{r}
+load("datasets/pns_train.RData")
+
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(tidymodels)
+library(dials)
+library(themis)
+library(janitor)
+library(future)
+library(tictoc)
+```
+
+### Receita
+
+A `recipe` é como uma lista de instruções para preparar os dados antes de entregá-los ao modelo. É a parte mais crucial para garantir consistência e robustez.
+
+```{r}
+recipe_xgb <- recipe(depressao ~ ., data = pns_train) %>%
+  
+  # 1.1. Imputação de valores ausentes (a mesma estratégia pode ser mantida)
+  step_impute_knn(all_numeric_predictors(), neighbors = 3) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # 1.2. Tratamento de variáveis categóricas
+  # Garante que novos níveis em dados futuros não quebrem o modelo
+  step_unknown(all_nominal_predictors()) %>%
+  
+  # IMPORTANTE: Converte variáveis categóricas em numéricas (dummy variables)
+  # Essencial para o funcionamento do XGBoost
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # 1.3. Remove colunas com variância zero (constantes)
+  step_zv(all_predictors()) %>%
+  
+  # 1.4. Balanceamento de classes (SMOTE é uma excelente escolha)
+  step_smote(depressao)
+  #step_downsample(depressao)
+
+```
+
+### Treinamento de Regressão logística polinomial regularizada
+
+Configurando a Paralelização
+
+```{r}
+# Paralelizando
+plan(multisession, workers = parallel::detectCores())
+# plan(sequential)
+```
+
+### Definição da Especificação do Modelo
+
+Definimos o modelo como 'boost_tree' e o motor como 'xgboost'. \# Selecionamos um conjunto robusto de hiperparâmetros para o tuning, \# que são cruciais para a performance do XGBoost.
+
+```{r}
+xgb_spec <- boost_tree(
+  trees = 1000,
+  tree_depth = tune(),       # Profundidade máxima da árvore
+  min_n = tune(),            # Mínimo de observações por nó
+  loss_reduction = tune(),   # Redução de perda para fazer um split (gamma)
+  sample_size = tune(),      # Proporção de amostras por árvore
+  mtry = tune(),             # Número de variáveis por split
+  learn_rate = tune(),      # Taxa de aprendizado (eta)
+) %>%
+  set_engine("xgboost") %>%
+  set_mode("classification")
+```
+
+### Criação do Fluxo de Trabalho (Workflow)
+
+Um 'workflow' é um objeto do tidymodels que age como um "container". Ele empacota o pré-processamento (a recipe) e a especificação do modelo (o model spec). Isso é extremamente útil porque simplifica todo o processo de treinamento e predição, garantindo que os dados passem pelas etapas corretas e na ordem certa.
+
+```{r}
+xgb_wkfl <- workflow() %>%
+  add_recipe(recipe_xgb) %>%
+  add_model(xgb_spec)
+```
+
+### Preparação da Reamostragem (Resampling)
+
+Para avaliar o quão bem nosso modelo funciona, não podemos usar o conjunto de teste ainda. Em vez disso, usamos a validação cruzada (cross-validation) no conjunto de treino. vfold_cv() divide o conjunto de treino (`pnsTrain`) em 10 partes (ou "folds"). O modelo será treinado 10 vezes: a cada vez, ele usa 9 partes para treinar e 1 para validar. Isso nos dá uma estimativa de performance muito mais estável e confiável.
+
+```{r}
+folds <- vfold_cv(pns_train, v = 5)
+```
+
+### Métricas para Otimização
+
+Cria o conjunto de métricas a serem utilizadas para avaliar o modelo
+
+```{r}
+metricas_completas <- metric_set(
+  accuracy,
+  roc_auc,
+  precision,
+  recall,
+  metric_tweak("f2", f_meas, beta = 2) # cria o F2-score
+)
+```
+
+### Otimização (Tuning) dos Hiperparâmetros
+
+`tune_grid()` irá testar sistematicamente diferentes valores para os hiperparâmetros que marcamos com `tune()` anteriormente (penalty e mixture).
+
+```{r}
+
+tic("Treinamento do modelo")
+fit_xgb <- xgb_wkfl %>%
+  tune_grid(
+    resamples = folds,
+    
+    # `grid = 50`: Gera 50 combinações de hiperparâmetros para testar.
+    # Uma grade maior pode encontrar resultados melhores, mas levará mais tempo.
+    grid = 100, 
+    
+    metrics = metricas_completas,
+    
+    # `control = control_grid(save_pred = TRUE)` é útil para analisar 
+    # as predições de cada modelo depois.
+    control = control_grid(save_pred = TRUE, verbose = TRUE)
+  )
+
+toc()
+```
+
+### Salvando modelo treinado
+
+```{r}
+saveRDS(fit_xgb, file = "xgboost.rds")
+#fit_rf 
+```
+
+### Análise dos Resultados da Otimização
+
+```{r}
+fit_xgb = readRDS("xgboost.rds")
+
+# A função `select_best()` examina os resultados da otimização (`fit_log_reg`)
+# e extrai a linha com a melhor performance, de acordo com a métrica especificada.
+best_params <- select_best(fit_xgb, metric = "roc_auc")
+
+# Imprime o tibble `best_params` para vermos os valores exatos de `penalty` e `mixture`
+# que resultaram no melhor modelo.
+best_params
+
+# 2. MOSTRAR OS MELHORES (PARA COMPARAÇÃO):
+# A função `show_best()` é similar, mas em vez de extrair apenas o melhor,
+# ela exibe uma tabela com os 5 melhores modelos por padrão.
+# É útil para ver se outras combinações de parâmetros tiveram performance parecida.
+show_best(fit_xgb, metric = 'roc_auc')
+show_best(fit_xgb, metric = 'precision')
+show_best(fit_xgb, metric = 'recall')
+show_best(fit_xgb, metric = 'accuracy')
+```
+
+```{r}
+# Isso criará um gráfico para cada métrica, mostrando o desempenho
+# em relação aos valores dos hiperparâmetros
+autoplot(fit_xgb)
+```
+
+```{r}
+#preds <- collect_predictions(fit_xgb)
+
+# 
+
+# 2. Calcular métricas a partir das previsões para cada configuração
+# Agrupamos por .config para calcular as métricas em todas as previsões de validação
+# de uma só vez, o que nos dá a performance geral de cada modelo.
+metricas_por_config <- preds %>%
+  group_by(.config) %>%
+  summarise(
+    # CORREÇÃO: As funções de métrica (accuracy, roc_auc, etc.) precisam receber
+    # o data frame (representado por '.') como primeiro argumento.
+    
+    # Métricas que usam a classe prevista (.pred_class)
+    accuracy  = accuracy(., truth = depressao, estimate = .pred_class)$.estimate,
+    precision = precision(., truth = depressao, estimate = .pred_class, event_level = "second")$.estimate,
+    recall    = recall(., truth = depressao, estimate = .pred_class, event_level = "second")$.estimate,
+    f2        = f_meas(., truth = depressao, estimate = .pred_class, beta = 2, event_level = "second")$.estimate,
+    
+    # Métrica que usa a probabilidade prevista (supondo que a classe positiva seja 'Sim')
+    roc_auc   = roc_auc(., truth = depressao, .pred_Sim)$.estimate,
+    
+    .groups = "drop"
+  )
+
+# 3. Extrair os hiperparâmetros de cada configuração
+parametros <- fit_xgb %>%  
+  collect_metrics(summarize = TRUE) %>%
+  select(.config, any_of(c(
+    "tree_depth", "min_n", "loss_reduction", 
+    "sample_size", "mtry", "learn_rate"
+  ))) %>%
+  distinct()
+
+# 4. Combinar as métricas calculadas com os parâmetros correspondentes
+tabela_final <- left_join(metricas_por_config, parametros, by = ".config") %>%
+  arrange(desc(roc_auc))
+
+# 5. Visualizar a tabela final
+print(tabela_final, n = 50)
+
+```
+
+## Seleção de melhores hiperparâmetros
+
+```{r}
+resultados_xgb <- fit_xgb %>% 
+  collect_metrics(type = "wide")  %>% 
+  arrange(desc(roc_auc))
+resultados_xgb
+
+## Permutation Importance
+
+
+
+```

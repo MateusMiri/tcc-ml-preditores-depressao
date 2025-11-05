@@ -1,0 +1,237 @@
+---
+title: "Rede Neural"
+format: html
+editor: visual
+---
+
+### Importando os dados
+
+Importamos os dados de treinamento já tratados anteriormente.
+
+```{r}
+#Sys.setenv(RETICULATE_PYTHON = "C:/Users/mateu/OneDrive/Documentos/.virtualenvs/r-tensorflow/Scripts/python.exe")
+
+load("datasets/pns_train.RData")
+
+library(reticulate)
+#py_require("tensorflow")
+library(tensorflow)
+library(dplyr)
+library(tidyr)
+library(tidyverse)
+library(tidymodels)
+library(dials)
+library(themis)
+library(janitor)
+library(future)
+library(tictoc)
+library(keras)
+library(doFuture)
+library(torch)
+library(brulee)
+
+
+# Força o R a usar o ambiente virtualenv correto criado pelo install_tensorflow()
+#use_virtualenv("r-tensorflow", required = TRUE)
+
+
+```
+
+### Receita
+
+A `recipe` é como uma lista de instruções para preparar os dados antes de entregá-los ao modelo. É a parte mais crucial para garantir consistência e robustez.
+
+```{r}
+recipe_nn <- recipe(depressao ~ ., data = pns_train) %>%
+  
+  # 1. Imputação de valores ausentes (a mesma estratégia pode ser mantida)
+  step_impute_knn(all_numeric_predictors()) %>%
+  step_impute_mode(all_nominal_predictors()) %>%
+  
+  # 2. Tratamento de variáveis categóricas
+  step_unknown(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) %>%
+  
+  # 3. Normalização (MUITO IMPORTANTE PARA REDES NEURAIS)
+  # Coloca todas as variáveis numéricas na mesma escala (média 0, desvio padrão 1)
+  step_normalize(all_numeric_predictors()) %>%
+  
+  # 4. Remove colunas com variância zero
+  step_zv(all_predictors()) %>%
+  
+  # 5. Balanceamento de classes
+  step_smote(depressao)
+
+```
+
+### Treinamento de Regressão logística polinomial regularizada
+
+Configurando a Paralelização
+
+```{r}
+# Paralelizando
+plan(multisession, workers = parallel::detectCores())
+# plan(sequential)
+```
+
+### Definição da Especificação do Modelo
+
+Usamos mlp() para uma rede neural do tipo Multilayer Perceptron. Vamos tunar o número de neurónios na camada oculta, a penalidade (regularização) e o número de épocas de treino
+
+```{r}
+nn_spec_brulee <- mlp(
+  hidden_units = tune(),
+  penalty = tune(),
+  epochs = tune()
+) %>%
+  # Use o motor 'brulee'
+  set_engine(
+    "brulee",
+    # Isso separa 20% dos dados de treino (de CADA fold)
+    # para validação interna e early stopping.
+    # É O GRANDE SEGREDO PARA ACELERAR O TUNING.
+    validation = 0.2
+  ) %>%
+  set_mode("classification")
+```
+
+### Criação do Fluxo de Trabalho (Workflow)
+
+Um 'workflow' é um objeto do tidymodels que age como um "container". Ele empacota o pré-processamento (a recipe) e a especificação do modelo (o model spec). Isso é extremamente útil porque simplifica todo o processo de treinamento e predição, garantindo que os dados passem pelas etapas corretas e na ordem certa.
+
+```{r}
+nn_wkfl <- workflow() %>%
+  add_recipe(recipe_nn) %>% 
+  add_model(nn_spec_brulee)
+```
+
+### Preparação da Reamostragem (Resampling)
+
+Para avaliar o quão bem nosso modelo funciona, não podemos usar o conjunto de teste ainda. Em vez disso, usamos a validação cruzada (cross-validation) no conjunto de treino. vfold_cv() divide o conjunto de treino (`pnsTrain`) em 10 partes (ou "folds"). O modelo será treinado 10 vezes: a cada vez, ele usa 9 partes para treinar e 1 para validar. Isso nos dá uma estimativa de performance muito mais estável e confiável.
+
+```{r}
+folds <- vfold_cv(pns_train, v = 5)
+```
+
+### Métricas para Otimização
+
+Cria o conjunto de métricas a serem utilizadas para avaliar o modelo
+
+```{r}
+metricas_completas <- metric_set(
+  accuracy,
+  roc_auc,
+  precision,
+  recall,
+  metric_tweak("f2", f_meas, beta = 2) # cria o F2-score
+)
+```
+
+### Otimização (Tuning) dos Hiperparâmetros
+
+`tune_grid()` irá testar sistematicamente diferentes valores para os hiperparâmetros que marcamos com `tune()` anteriormente (penalty e mixture).
+
+```{r}
+
+tic("Treinamento do modelo")
+fit_nn <- nn_wkfl %>%
+  tune_grid(
+    resamples = folds,
+    grid = 50, 
+    metrics = metricas_completas,
+    control = control_grid(save_pred = TRUE, verbose = TRUE)
+  )
+
+toc()
+```
+
+### Salvando modelo treinado
+
+```{r}
+saveRDS(fit_nn, file = "rede_neural_2.rds")
+```
+
+### Análise dos Resultados da Otimização
+
+```{r}
+
+#fit_xgb = readRDS("rede_neural.rds")
+# A função `select_best()` examina os resultados da otimização (`fit_nn`)
+# e extrai a linha com a melhor performance, de acordo com a métrica especificada.
+best_params <- select_best(fit_nn, metric = "roc_auc")
+
+# Imprime o tibble `best_params` para vermos os valores exatos de `penalty` e `mixture`
+# que resultaram no melhor modelo.
+best_params
+
+# 2. MOSTRAR OS MELHORES (PARA COMPARAÇÃO):
+# A função `show_best()` é similar, mas em vez de extrair apenas o melhor,
+# ela exibe uma tabela com os 5 melhores modelos por padrão.
+# É útil para ver se outras combinações de parâmetros tiveram performance parecida.
+show_best(fit_nn, metric = 'roc_auc')
+show_best(fit_nn, metric = 'precision')
+show_best(fit_nn, metric = 'recall')
+show_best(fit_nn, metric = 'accuracy')
+```
+
+```{r}
+# Isso criará um gráfico para cada métrica, mostrando o desempenho
+# em relação aos valores dos hiperparâmetros
+autoplot(fit_xgb)
+```
+
+```{r}
+#preds <- collect_predictions(fit_xgb)
+
+# 
+
+# 2. Calcular métricas a partir das previsões para cada configuração
+# Agrupamos por .config para calcular as métricas em todas as previsões de validação
+# de uma só vez, o que nos dá a performance geral de cada modelo.
+metricas_por_config <- preds %>%
+  group_by(.config) %>%
+  summarise(
+    # CORREÇÃO: As funções de métrica (accuracy, roc_auc, etc.) precisam receber
+    # o data frame (representado por '.') como primeiro argumento.
+    
+    # Métricas que usam a classe prevista (.pred_class)
+    accuracy  = accuracy(., truth = depressao, estimate = .pred_class)$.estimate,
+    precision = precision(., truth = depressao, estimate = .pred_class, event_level = "second")$.estimate,
+    recall    = recall(., truth = depressao, estimate = .pred_class, event_level = "second")$.estimate,
+    f2        = f_meas(., truth = depressao, estimate = .pred_class, beta = 2, event_level = "second")$.estimate,
+    
+    # Métrica que usa a probabilidade prevista (supondo que a classe positiva seja 'Sim')
+    roc_auc   = roc_auc(., truth = depressao, .pred_Sim)$.estimate,
+    
+    .groups = "drop"
+  )
+
+# 3. Extrair os hiperparâmetros de cada configuração
+parametros <- fit_xgb %>%  
+  collect_metrics(summarize = TRUE) %>%
+  select(.config, any_of(c(
+    "tree_depth", "min_n", "loss_reduction", 
+    "sample_size", "mtry", "learn_rate"
+  ))) %>%
+  distinct()
+
+# 4. Combinar as métricas calculadas com os parâmetros correspondentes
+tabela_final <- left_join(metricas_por_config, parametros, by = ".config") %>%
+  arrange(desc(roc_auc))
+
+# 5. Visualizar a tabela final
+print(tabela_final, n = 50)
+
+```
+
+## Seleção de melhores hiperparâmetros
+
+```{r}
+resultados_nn <- fit_nn %>% 
+  collect_metrics(type = "wide")  %>% 
+  arrange(desc(roc_auc))
+resultados_nn
+
+## Permutation Importance
+
+```

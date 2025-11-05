@@ -1,0 +1,348 @@
+---
+title: "Preparação e Limpeza dos Dados da PNS 2019"
+format: html
+editor: visual
+---
+
+## 1. Configuração Inicial
+
+Nesta seção, carregamos todas as bibliotecas necessárias para a análise e definimos uma semente de aleatoriedade para garantir que os resultados sejam reprodutíveis.
+
+```{r setup}
+# Carregamento das bibliotecas necessárias
+library(tidyverse)  # Pacote principal para manipulação de dados e visualização
+library(tidymodels) # Framework para modelagem de machine learning
+library(janitor)    # Funções para limpeza de dados, como a `tabyl()`
+library(skimr)      # Para resumos estatísticos rápidos do dataset
+
+# Define uma semente de aleatoriedade para garantir a reprodutibilidade dos resultados
+set.seed(502)
+```
+
+## 2. Carga e Seleção de Dados
+
+Aqui, carregamos o conjunto de dados da PNS 2019, filtramos para manter apenas os registros relevantes e selecionamos as variáveis que serão utilizadas no modelo.
+
+```{r load-and-filter-data}
+# Carrega o banco de dados salvo em formato .RData
+load("pns2019.rdata")
+
+# 2.1. Filtragem inicial
+# O objetivo é manter apenas os registros onde a variável alvo (depressão, Q092)
+# possui uma resposta válida (1 para "Sim" ou 2 para "Não").
+# Registros com NA ou outros códigos são removidos.
+pns2019_filtrado <- pns2019 %>% 
+    filter(Q092 %in% c(1, 2))
+
+# 2.2. Seleção e Renomeação das Variáveis
+# Selecionamos as colunas de interesse para o estudo e as renomeamos 
+# para nomes mais curtos e intuitivos, facilitando a manipulação.
+pns2019_selecionado <- pns2019_filtrado %>% 
+    select(
+        # Variável Alvo
+        depressao = Q092, 
+        
+        # Preditores Demográficos
+        sexo = C006, 
+        idade = C008, 
+        est_civil = C011,
+        cor_raca = C009,
+        nivel_educacao = VDD004A,
+        faixa_rendimento = VDF004,
+        
+        # Preditores de Saúde e Comportamento
+        freq_cansado = N011, 
+        freq_interesse = N012,
+        freq_alimentacao = N014, 
+        freq_sentiu_mal = N017, 
+        freq_pensou_ferir = N018,
+        est_saude = N001,
+        freq_bebida_alcoolica = P027,
+        freq_tabaco = P050,
+        freq_cigarro = P05401,
+        teve_relacao_sexual = Y002,
+        est_saude_mental = N00101,
+        freq_problema_sono = N010,
+        freq_concentracao = N013,
+        freq_movimentacao = N015,
+        freq_deprimido = N016,
+        
+        # Preditores Sociais e de Estilo de Vida
+        conjuge_mora_junto = C01001,
+        animais_estimacao = A02201,
+        parentes_conf = M01401,
+        amigos_conf = M01501,
+        reuniu_atividade_fisica = M01601,
+        exerc_fisico_qual = P036,
+        reuniu_atividade_religiosa = M01901,
+        
+        # Preditores de Violência e Assédio
+        ridicularizado = V00201,
+        assediado = V02801,
+        violentado = V02802,
+        foi_xingado = V00202,
+        violencia_rede_social = V00203,
+        propriedade_destruida = V00205,
+        levou_tapa = V01401,
+        levou_empurrao = V01402,
+        levou_soco = V01403,
+        quant_violencia_sofrida = V029,
+        local_sofreu_violencia = V033,
+        quem_realizou_violencia = V032,
+
+        # Preditores de Trabalho
+        cond_trabalho = VDE001,
+        trabalhou = E001,
+        horas_semanais_trabalhadas = E017,
+        freq_trabalho_noturno = M00601,
+        freq_trabalho_24h = M007,
+        amb_trabalho = M009,
+        
+        # Outros Preditores
+        tipo_domicilio = A001,
+        tipo_area = V0031,
+        possui_internet = A01901,
+        tipo_escola = D00202,
+        plano_saude = I00102,
+        numero_partos = S066
+    )
+
+pns2019_original <- pns2019_selecionado
+```
+
+## 3. Pré-processamento e Recodificação
+
+Nesta etapa, transformamos as variáveis numéricas em fatores com rótulos descritivos, tratamos valores ausentes (NA) e ajustamos os tipos de dados para prepará-los para a modelagem.
+
+```{r recode-variables}
+# 3.1. Recodificação da Variável Alvo
+# A variável 'depressao' é transformada em um fator binário:
+# 1 (Sim) e 2 (Não) são convertidos para os níveis "Sim" e "Não".
+pns_recodificado <- pns2019_selecionado %>% 
+    mutate(
+        depressao = if_else(depressao == 1, "Sim", "Não"),
+        depressao = factor(depressao, levels = c("Não", "Sim"))
+    )
+
+# 3.2. Recodificação de Variáveis Ordinais (com ordem)
+# Variáveis de frequência e de escala são convertidas para fatores ordenados.
+# O código '9' (Ignorado) é substituído por NA (Not Available).
+pns_recodificado <- pns_recodificado %>%
+  mutate(
+    # Frequência de cansaço
+    freq_cansado = na_if(freq_cansado, 9),
+    freq_cansado = factor(freq_cansado, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+    
+    # Frequência de falta de interesse
+    freq_interesse = na_if(freq_interesse, 9),
+    freq_interesse = factor(freq_interesse, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+    # Frequência de problemas de alimentação
+    freq_alimentacao = na_if(freq_alimentacao, 9),
+    freq_alimentacao = factor(freq_alimentacao, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+    # Frequência de se sentir mal consigo mesmo
+    freq_sentiu_mal = na_if(freq_sentiu_mal, 9),
+    freq_sentiu_mal = factor(freq_sentiu_mal, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+    # Frequência de pensar em se ferir
+    freq_pensou_ferir = na_if(freq_pensou_ferir, 9),
+    freq_pensou_ferir = factor(freq_pensou_ferir, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+    # Nível de educação
+    nivel_educacao = factor(nivel_educacao, levels = 1:7, labels = c("Sem instrução", "Fundamental incompleto", "Fundamental completo", "Médio incompleto", "Médio completo", "Superior incompleto", "Superior completo"), ordered = TRUE),
+
+    # Autoavaliação do estado de saúde
+    est_saude = na_if(est_saude, 9),
+    est_saude = factor(est_saude, levels = 1:5, labels = c("Muito boa", "Boa", "Regular", "Ruim", "Muito ruim"), ordered = TRUE),
+    
+    # Frequência de consumo de álcool
+    freq_bebida_alcoolica = na_if(freq_bebida_alcoolica, 9),
+    freq_bebida_alcoolica = factor(freq_bebida_alcoolica, levels = 1:3, labels = c("Nunca", "Menos de uma vez por mês", "Uma vez ou mais por mês"), ordered = TRUE),
+
+    # Frequência de uso de tabaco
+    freq_tabaco = na_if(freq_tabaco, 9),
+    freq_tabaco = factor(freq_tabaco, levels = 1:3, labels = c("Diariamente", "Menos que diariamente", "Não fuma"), ordered = TRUE),
+    
+    # Faixa de rendimento
+    faixa_rendimento = factor(faixa_rendimento, levels = 1:7, labels = c("Até 1/4 SM", "1/4 a 1/2 SM", "1/2 a 1 SM", "1 a 2 SM", "2 a 3 SM", "3 a 5 SM", "Mais de 5 SM"), ordered = TRUE),
+    
+    freq_cigarro = na_if(freq_cigarro, 9),
+    freq_cigarro = factor(freq_cigarro, levels = 1:5, labels = c("Um ou mais por dia", "Um ou mais por semana", "Menos que uma vez por semana", "Menos do que um por mês", "Não fuma este produto"), ordered = TRUE),
+
+        freq_trabalho_noturno = factor(freq_trabalho_noturno, levels = 1:6, labels = c("Menos de 1 vez por mês", "1 a 3 vezes por mês", "1 vez por semana", "2 a 3 vezes por semana", "4 vezes por semana", "5 vezes ou mais por semana"), ordered = TRUE),
+
+        parentes_conf = factor(parentes_conf, levels = 0:3, labels = c("Nenhum", "Um", "Dois", "Três ou mais"), ordered = TRUE),
+        amigos_conf = factor(amigos_conf, levels = 0:3, labels = c("Nenhum", "Um", "Dois", "Três ou mais"), ordered = TRUE),
+
+        reuniu_atividade_fisica = factor(reuniu_atividade_fisica, levels = 1:6, labels = c("Mais de uma vez por semana", "Uma vez por semana", "De 2 a 3 vezes por mês", "Algumas vezes no ano", "Uma vez no ano", "Nenhuma vez"), ordered = TRUE),
+
+        reuniu_atividade_religiosa = factor(reuniu_atividade_religiosa, levels = 1:6, labels = c("Mais de uma vez por semana", "Uma vez por semana", "De 2 a 3 vezes por mês", "Algumas vezes no ano", "Uma vez no ano", "Nenhuma vez"), ordered = TRUE),
+
+        est_saude_mental = na_if(est_saude_mental, 9),
+        est_saude_mental = factor(est_saude_mental, levels = 1:5, labels = c("Muito boa", "Boa", "Regular", "Ruim", "Muito ruim"), ordered = TRUE),
+
+        freq_problema_sono = na_if(freq_problema_sono, 9),
+        freq_problema_sono = factor(freq_problema_sono, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+        freq_concentracao = na_if(freq_concentracao, 9),
+        freq_concentracao = factor(freq_concentracao, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+        freq_movimentacao = na_if(freq_movimentacao, 9),
+        freq_movimentacao = factor(freq_movimentacao, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+
+        freq_deprimido = na_if(freq_deprimido, 9),
+        freq_deprimido = factor(freq_deprimido, levels = 1:4, labels = c("Nenhum dia", "Menos da metade dos dias", "Mais da metade dos dias", "Quase todos dias"), ordered = TRUE),
+        
+        quant_violencia_sofrida = factor(quant_violencia_sofrida, levels = 1:3, labels = c("Muitas vezes", "Algumas vezes", "Uma vez"), ordered = TRUE)
+  )
+
+# 3.3. Recodificação de Variáveis Categóricas (sem ordem)
+pns_recodificado <- pns_recodificado %>%
+  mutate(
+    # Sexo
+    sexo = factor(sexo, levels = c(1, 2), labels = c("Homem", "Mulher")),
+    
+    # Estado civil
+    est_civil = na_if(est_civil, 9),
+    est_civil = factor(est_civil, levels = 1:4, labels = c("Casado(a)", "Divorciado(a)/Separado(a)", "Viúvo(a)", "Solteiro(a)")),
+    
+    # Cor/Raça
+    cor_raca = na_if(cor_raca, 9),
+    cor_raca = factor(cor_raca, levels = 1:5, labels = c("Branca", "Preta", "Amarela", "Parda", "Indígena")),
+    
+    # Tipo de domicílio
+    tipo_domicilio = na_if(tipo_domicilio, 9),
+    tipo_domicilio = factor(tipo_domicilio, levels = 1:3, labels = c("Casa", "Apartamento", "Cômodos/Cortiço")),
+    
+    #orient_sexual = na_if(orient_sexual, 5), # "Não sabe" tratado como NA
+    #orient_sexual = na_if(orient_sexual, 6), # "Recusou-se a responder" tratado como NA
+    #orient_sexual = factor(orient_sexual, levels = 1:4, labels = c("Heterosexual", "Bissexual", "Homosexual", "Outra orientação")),
+
+    exerc_fisico_qual = na_if(exerc_fisico_qual, 99),
+    exerc_fisico_qual = factor(exerc_fisico_qual), # Alta cardinalidade, apenas converter
+        
+    tipo_area = factor(tipo_area, levels = 1:4, labels = c("Capital", "Resto da RM", "RIDE", "Resto da UF")),
+
+    tipo_escola = na_if(tipo_escola, 9),
+    tipo_escola = factor(tipo_escola, levels = 1:2, labels = c("Rede privada", "Rede pública")),
+        
+    amb_trabalho = factor(amb_trabalho, levels = 1:3, labels = c("Fechados", "Abertos", "Ambos")),
+
+    local_sofreu_violencia = factor(local_sofreu_violencia, levels = 1:6, labels = c("Residência", "Trabalho", "Escola/Faculdade", "Bar/Restaurante", "Via pública/Outro local público", "Outro")),
+
+    quem_realizou_violencia = factor(quem_realizou_violencia), # Alta cardinalidade, apenas converter
+    
+    numero_partos = na_if(numero_partos, 99),
+
+  )
+
+# 3.4. Recodificação de Variáveis Binárias (Sim/Não)
+# Várias variáveis de resposta "Sim/Não" são convertidas para fatores.
+# O padrão é: 1 -> Sim, 2 -> Não. Convertemos para um fator "Sim"/"Não".
+pns_recodificado <- pns_recodificado %>%
+  mutate(
+    # Cônjuge mora junto
+    conjuge_mora_junto = na_if(conjuge_mora_junto, 9),
+    conjuge_mora_junto = factor(if_else(conjuge_mora_junto == 1, "Sim", "Não")),
+    
+    # Foi ridicularizado
+    ridicularizado = factor(if_else(ridicularizado == 1, "Sim", "Não")),
+    
+    # Foi assediado
+    assediado = factor(if_else(assediado == 1, "Sim", "Não")),
+    
+    # Foi violentado
+    violentado = factor(if_else(violentado == 1, "Sim", "Não")),
+    
+    # Teve relação sexual nos últimos 12 meses
+    teve_relacao_sexual = na_if(teve_relacao_sexual, 3),
+    teve_relacao_sexual = factor(if_else(teve_relacao_sexual == 1, "Sim", "Não")),
+    
+    # Condição de trabalho (1=Na força de trabalho, 2=Fora)
+    cond_trabalho = factor(if_else(cond_trabalho == 1, "Na força de trabalho", "Fora da força de trabalho")),
+    
+    # Possui animais de estimação
+    animais_estimacao = na_if(animais_estimacao, 9),
+    animais_estimacao = factor(if_else(animais_estimacao == 1, "Sim", "Não")),
+    
+    # Trabalhou na última semana
+    trabalhou = na_if(trabalhou, 9),
+    trabalhou = factor(if_else(trabalhou == 1, "Sim", "Não")),
+    
+    # Possui internet
+    possui_internet = na_if(possui_internet, 9),
+    possui_internet = factor(if_else(possui_internet == 1, "Sim", "Não")),
+    
+    # Tem plano de saúde
+    plano_saude = na_if(plano_saude, 9),
+    plano_saude = factor(if_else(plano_saude == 1, "Sim", "Não")),
+    
+    # Trabalhava por 24h seguidas
+    freq_trabalho_24h = factor(if_else(freq_trabalho_24h == 1, "Sim", "Não")),
+        
+    # Recebeu xingamentos de outra pessoa
+    foi_xingado = factor(if_else(foi_xingado == 1, "Sim", "Não")),
+        
+    # Sofreu de violência em redes socieais
+    violencia_rede_social = factor(if_else(violencia_rede_social == 1, "Sim", "Não")),
+        
+    # Teve sua propriedade destruída por vandalismo ou preconceito
+    propriedade_destruida = factor(if_else(propriedade_destruida == 1, "Sim", "Não")),
+        
+    # Sofreu de agressões físicas vindas de tapas
+    levou_tapa = factor(if_else(levou_tapa == 1, "Sim", "Não")),
+    
+    # Sofreu de agressões físicas vindas de empurrões    
+    levou_empurrao = factor(if_else(levou_empurrao == 1, "Sim", "Não")),
+        
+    # Sofreu de agressões físicas vindas de socos
+    levou_soco = factor(if_else(levou_soco == 1, "Sim", "Não"))
+  )
+
+# 3.5. Recodificação de variáveis muito ausentes
+# Variáveis com mais de 50% de missing, serão consideradas como uma nova categoria própria
+pns_recodificado <- pns_recodificado %>%
+  mutate(
+    quant_violencia_sofrida = fct_explicit_na(quant_violencia_sofrida, na_level = "Não Informado"),
+    freq_cigarro = fct_explicit_na(freq_cigarro, na_level = "Não Informado"),
+    tipo_escola = fct_explicit_na(tipo_escola, na_level = "Não Informado"),
+    freq_trabalho_24h = fct_explicit_na(freq_trabalho_24h, na_level = "Não Informado"),
+    freq_trabalho_noturno = fct_explicit_na(freq_trabalho_noturno, na_level = "Não Informado"),
+    quem_realizou_violencia = fct_explicit_na(quem_realizou_violencia, na_level = "Não Informado"),
+    local_sofreu_violencia = fct_explicit_na(local_sofreu_violencia, na_level = "Não Informado"),
+    exerc_fisico_qual = fct_explicit_na(exerc_fisico_qual, na_level = "Não Informado")
+  )
+
+
+# Visualiza a estrutura final dos dados para garantir que as transformações foram aplicadas
+glimpse(pns_recodificado)
+```
+
+## 4. Divisão e Armazenamento dos Dados
+
+Finalmente, dividimos o conjunto de dados em amostras de treino e teste e as salvamos em arquivos separados para serem usados na etapa de modelagem.
+
+```{r split-and-save}
+# 4.1. Divisão em Treino e Teste
+# Divide os dados em 80% para treinamento e 20% para teste.
+# A estratificação pela variável 'depressao' garante que a proporção de 
+# casos positivos e negativos seja a mesma em ambos os conjuntos.
+pns_split <- initial_split(pns_recodificado, prop = 0.80, strata = depressao)
+
+# Cria os data frames de treino e teste
+pns_train <- training(pns_split)
+pns_test  <- testing(pns_split)
+
+# 4.2. Salvando os Dados Processados
+# Salva os conjuntos de treino e teste em arquivos .RData.
+# Isso permite carregar os dados já processados diretamente em outros scripts
+# sem precisar repetir todas as etapas de limpeza.
+save(pns_train, file = "datasets/pns_train.RData")
+save(pns_test, file = "datasets/pns_test.RData")
+save(pns2019_original, file = "datasets/pns_original.RData")
+
+# Exibe as dimensões dos data frames criados
+cat("Dimensões do conjunto de treino:", dim(pns_train), "\n")
+cat("Dimensões do conjunto de teste:", dim(pns_test), "\n")
+```
